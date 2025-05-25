@@ -1,7 +1,12 @@
 [package]
 name = "dg_sysfs"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+authors = ["James Hoerr"]
+description = "Utils for working with SysFS in Garden OS"
+license = "Apache-2.0"
+homepage = "https://github.com/GalactechsLLC/dg_sysfs_utils"
+repository = "https://github.com/GalactechsLLC/dg_sysfs_utils"
 
 [dependencies]
 libc = "0.2.170"
