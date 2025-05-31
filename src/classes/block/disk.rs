@@ -2,23 +2,203 @@ use crate::classes::block::BLOCK_CLASS;
 use crate::{DEV_DIR, MOUNTS_FILE, SysFsNode, read_value};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{Error, ErrorKind, SeekFrom};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use uuid::{Builder, Uuid};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SpaceInfo {
-    total_space: u64,
-    free_space: u64,
-    used_space: u64,
+use crate::STATS_FILE;
+
+fn default_instant() -> Instant {
+    Instant::now()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct DiskStats {
+    pub major: u32,
+    pub minor: u32,
+    pub reads_completed: u64,
+    pub reads_merged: u64,
+    pub sectors_read: u64,
+    pub ms_reading: u64,
+    pub writes_completed: u64,
+    pub writes_merged: u64,
+    pub sectors_written: u64,
+    pub ms_writing: u64,
+    pub io_in_progress: u64,
+    pub ms_io: u64,
+    pub weighted_ms_io: u64,
+    pub discards_completed: Option<u64>,
+    pub discards_merged: Option<u64>,
+    pub sectors_discarded: Option<u64>,
+    pub ms_discarding: Option<u64>,
+    pub flush_requests: Option<u64>,
+    pub ms_flushing: Option<u64>,
+    #[serde(skip)]
+    #[serde(default = "default_instant")]
+    pub timestamp: Instant,
+}
+#[derive(Serialize)]
+pub struct DiskUsage {
+    pub recently_read: u64,
+    pub recently_writen: u64,
+    pub total_read: u64,
+    pub total_writen: u64,
+}
+#[derive(Default, Debug)]
+pub struct DiskStatsMap {
+    current_stats: HashMap<String, DiskStats>,
+    previous_stats: HashMap<String, DiskStats>,
+}
+impl DiskStatsMap {
+    pub async fn parse() -> Result<Self, Error> {
+        let file = File::open(STATS_FILE).await?;
+        let mut lines = BufReader::new(file).lines();
+        let mut stat_map = HashMap::<String, DiskStats>::default();
+        while let Some(line) = lines.next_line().await? {
+            if let Some((name, ds)) = Self::parse_line(&line) {
+                stat_map.insert(name, ds);
+            }
+        }
+        Ok(DiskStatsMap {
+            current_stats: stat_map,
+            previous_stats: HashMap::<String, DiskStats>::default(),
+        })
+    }
+    pub async fn get(&self, name: &str) -> Option<DiskStats> {
+        self.current_stats.get(name).copied()
+    }
+    pub async fn reload(&mut self) -> Result<(), Error> {
+        let file = File::open(STATS_FILE).await?;
+        let mut lines = BufReader::new(file).lines();
+        while let Some(line) = lines.next_line().await? {
+            if let Some((name, ds)) = Self::parse_line(&line) {
+                if let Some(old_value) = self.current_stats.insert(name.clone(), ds) {
+                    self.previous_stats.insert(name, old_value);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn get_disk_usage(&self, name: &str) -> Option<DiskUsage> {
+        let current_stats = self.current_stats.get(name)?;
+        let previous_stats = self.previous_stats.get(name);
+        match previous_stats {
+            Some(previous_stats) => {
+                let seconds_difference = current_stats
+                    .timestamp
+                    .duration_since(previous_stats.timestamp)
+                    .as_millis();
+                let delta_read = current_stats
+                    .sectors_read
+                    .saturating_sub(previous_stats.sectors_read)
+                    as u128
+                    / seconds_difference;
+                let delta_written = current_stats
+                    .sectors_written
+                    .saturating_sub(previous_stats.sectors_written)
+                    as u128
+                    / seconds_difference;
+                Some(DiskUsage {
+                    recently_read: (delta_read / 1000) as u64,
+                    recently_writen: (delta_written / 1000) as u64,
+                    total_read: current_stats.sectors_read,
+                    total_writen: current_stats.sectors_written,
+                })
+            }
+            None => Some(DiskUsage {
+                recently_read: 0,
+                recently_writen: 0,
+                total_read: current_stats.sectors_read,
+                total_writen: current_stats.sectors_written,
+            }),
+        }
+    }
+    fn parse_line(line: &str) -> Option<(String, DiskStats)> {
+        // Split on whitespace
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 14 {
+            return None;
+        }
+        // Parse the first two as u32
+        let major = parts[0].parse::<u32>().ok()?;
+        let minor = parts[1].parse::<u32>().ok()?;
+        let name = parts[2].to_string();
+
+        // Parse the next 11 fields as u64
+        let reads_completed = parts[3].parse::<u64>().ok()?;
+        let reads_merged = parts[4].parse::<u64>().ok()?;
+        let sectors_read = parts[5].parse::<u64>().ok()?;
+        let ms_reading = parts[6].parse::<u64>().ok()?;
+        let writes_completed = parts[7].parse::<u64>().ok()?;
+        let writes_merged = parts[8].parse::<u64>().ok()?;
+        let sectors_written = parts[9].parse::<u64>().ok()?;
+        let ms_writing = parts[10].parse::<u64>().ok()?;
+        let io_in_progress = parts[11].parse::<u64>().ok()?;
+        let ms_io = parts[12].parse::<u64>().ok()?;
+        let weighted_ms_io = parts[13].parse::<u64>().ok()?;
+
+        //Extended Fields May not Exist
+        let (
+            discards_completed,
+            discards_merged,
+            sectors_discarded,
+            ms_discarding,
+            flush_requests,
+            ms_flushing,
+        ) = if parts.len() >= 20 {
+            (
+                parts[14].parse::<u64>().ok(),
+                parts[15].parse::<u64>().ok(),
+                parts[16].parse::<u64>().ok(),
+                parts[17].parse::<u64>().ok(),
+                parts[18].parse::<u64>().ok(),
+                parts[19].parse::<u64>().ok(),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+        Some((
+            name,
+            DiskStats {
+                major,
+                minor,
+                reads_completed,
+                reads_merged,
+                sectors_read,
+                ms_reading,
+                writes_completed,
+                writes_merged,
+                sectors_written,
+                ms_writing,
+                io_in_progress,
+                ms_io,
+                weighted_ms_io,
+                discards_completed,
+                discards_merged,
+                sectors_discarded,
+                ms_discarding,
+                flush_requests,
+                ms_flushing,
+                timestamp: Instant::now(),
+            },
+        ))
+    }
+}
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub total_space: u64,
+    pub free_space: u64,
+    pub used_space: u64,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum DiskType {
     Mmc,
     Nvme,
@@ -28,7 +208,7 @@ pub enum DiskType {
     Virtual,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Partition {
     pub name: String,
     pub uuid: Option<Uuid>,
@@ -205,7 +385,7 @@ pub async fn find_partitions<P: AsRef<Path>>(path: P) -> Result<Vec<Partition>, 
 
 async fn get_mount_path<P: AsRef<Path>>(device: P) -> Result<Option<PathBuf>, Error> {
     // Open /proc/mounts for reading
-    let file = tokio::fs::File::open(MOUNTS_FILE).await?;
+    let file = File::open(MOUNTS_FILE).await?;
     let reader = BufReader::new(file);
     // Iterate through each line in /proc/mounts
     let mut lines = reader.lines();
@@ -243,7 +423,7 @@ async fn get_device_space<P: AsRef<Path>>(device: P) -> Result<Option<SpaceInfo>
     }))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum FileSystem {
     Btrfs,
     ExFAT,

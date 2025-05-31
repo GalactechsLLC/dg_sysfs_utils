@@ -163,14 +163,15 @@ impl NetEnumerator {
 
 #[tokio::test]
 pub async fn test_net_enumerator() {
-    use log::LevelFilter;
-    use simple_logger::SimpleLogger;
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
+    use dg_logger::DruidGardenLogger;
+    use log::Level;
+    use log::info;
+    let _logger = DruidGardenLogger::build()
+        .current_level(Level::Info)
         .init()
         .unwrap();
     let devices = NetEnumerator::new().get_devices().await.unwrap();
     for device in devices {
-        println!("{device:?}")
+        info!("{device:?}")
     }
 }

@@ -7,6 +7,7 @@ pub mod classes;
 const SYSFS_DIR: &str = "/sys/class";
 const DEV_DIR: &str = "/dev";
 const MOUNTS_FILE: &str = "/proc/mounts";
+const STATS_FILE: &str = "/proc/diskstats";
 
 #[allow(async_fn_in_trait)]
 pub trait SysFsNode: Sized {
