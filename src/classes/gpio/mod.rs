@@ -58,14 +58,14 @@ pub struct Pin {
 impl Pin {
     pub fn new(number: u8, pin_mode: PinMode) -> Result<Self, Error> {
         let (value, mode) = Self::export(number)
-            .map_err(|e| Error::new(e.kind(), format!("Error Exporting Pin: {:?}", e)))?;
+            .map_err(|e| Error::new(e.kind(), format!("Error Exporting Pin: {e:?}")))?;
         let mut slf = Self {
             number,
             value,
             mode,
         };
         slf.mode(pin_mode)
-            .map_err(|e| Error::new(e.kind(), format!("Error Setting Pin Mode: {:?}", e)))?;
+            .map_err(|e| Error::new(e.kind(), format!("Error Setting Pin Mode: {e:?}")))?;
         Ok(slf)
     }
     pub fn read_value(&mut self) -> Result<u8, Error> {
@@ -75,7 +75,7 @@ impl Pin {
         s[..1].parse::<u8>().map_err(|e| {
             Error::new(
                 ErrorKind::InvalidData,
-                format!("Failed to parse value of pin {}: {:?}", self.number, e),
+                format!("Failed to parse value of pin {}: {e:?}", self.number),
             )
         })
     }
@@ -109,6 +109,7 @@ impl Drop for Pin {
         Self::unexport(self.number).unwrap_or_default()
     }
 }
+#[derive(Default)]
 pub struct PinSet {
     pins: HashMap<u8, PwmSignalHandler>,
 }

@@ -558,7 +558,7 @@ async fn read_gpt_part_guid<P: AsRef<Path>>(
     if part_index == 0 || (part_index as u64) > entry_count {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("Bad Index: {}", part_index),
+            format!("Bad Index: {part_index}"),
         ));
     }
     let entry_offset = part_entries_lba * SECTOR_SIZE + (part_index as u64 - 1) * entry_size + 16;
