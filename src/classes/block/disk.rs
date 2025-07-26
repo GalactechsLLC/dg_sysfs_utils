@@ -257,9 +257,14 @@ impl SysFsNode for Partition {
                         used_space: 0,
                     })
                 };
+                let uuid = if let Some(part_no) = number.as_ref().and_then(|n| n.parse().ok()) {
+                    get_part_uuid(path, part_no).await.ok()
+                } else {
+                    None
+                };
                 Ok(Partition {
                     name,
-                    uuid: None,
+                    uuid,
                     node: path.to_path_buf(),
                     number,
                     device,
@@ -435,102 +440,170 @@ async fn get_device_space<P: AsRef<Path>>(device: P) -> Result<Option<SpaceInfo>
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum FileSystem {
-    Btrfs,
-    ExFAT,
-    Ext2,
-    Ext3,
-    Ext4,
-    F2FS,
-    FAT12,
-    FAT16,
-    FAT32,
-    ISO9660,
-    JFS,
-    NTFS,
-    ReiserFS,
+    Btrfs(Uuid),
+    ExFAT(Uuid),
+    Ext2(Uuid),
+    Ext3(Uuid),
+    Ext4(Uuid),
+    F2FS(Uuid),
+    FAT12(Uuid),
+    FAT16(Uuid),
+    FAT32(Uuid),
+    ISO9660, // Usually no UUID
+    JFS(Uuid),
+    NTFS(Uuid),
+    ReiserFS(Uuid),
     Unknown,
-    XFS,
+    XFS(Uuid),
 }
 
 impl FileSystem {
     pub async fn from_dev<P: AsRef<Path>>(path: P) -> Result<Option<FileSystem>, Error> {
         debug!("Parsing Filesystem at {:?}", path.as_ref());
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = File::open(path.as_ref()).await?;
         // Read the boot sector (first 2048 bytes) for several checks.
         let mut buffer = [0u8; 2048];
         file.seek(SeekFrom::Start(0)).await?;
         file.read_exact(&mut buffer).await?;
 
-        // 1. XFS: "XFSB" at offset 0.
+        // Detect FS type + attach UUID
         if &buffer[0..4] == b"XFSB" {
-            return Ok(Some(FileSystem::XFS));
+            if let Some(uuid) = read_uuid(path.as_ref(), "xfs").await {
+                return Ok(Some(FileSystem::XFS(uuid)));
+            }
+            return Ok(Some(FileSystem::XFS(Uuid::nil())));
         }
-        // 2. JFS: "JFS1" at offset 0.
         if &buffer[0..4] == b"JFS1" {
-            return Ok(Some(FileSystem::JFS));
+            // JFS UUID is at 0xC0 (192) offset in superblock
+            let mut f = File::open(path.as_ref()).await?;
+            f.seek(SeekFrom::Start(0xC0)).await?;
+            let mut uuid_buf = [0u8; 16];
+            f.read_exact(&mut uuid_buf).await?;
+            return Ok(Some(FileSystem::JFS(Uuid::from_bytes(uuid_buf))));
         }
-        // 3. F2FS: First 4 bytes as little-endian should equal 0xF2F52010.
         let f2fs_magic = u32::from_le_bytes(buffer[..4].try_into().unwrap());
         if f2fs_magic == 0xF2F52010 {
-            return Ok(Some(FileSystem::F2FS));
+            // F2FS UUID is at 0x08 offset in the superblock (first block)
+            let mut f = File::open(path.as_ref()).await?;
+            f.seek(SeekFrom::Start(0x08)).await?;
+            let mut uuid_buf = [0u8; 16];
+            f.read_exact(&mut uuid_buf).await?;
+            return Ok(Some(FileSystem::F2FS(Uuid::from_bytes(uuid_buf))));
         }
-        // 4. NTFS: Check for "NTFS" at offset 3.
         if &buffer[3..7] == b"NTFS" {
-            return Ok(Some(FileSystem::NTFS));
+            if let Some(uuid) = read_uuid(path.as_ref(), "ntfs").await {
+                return Ok(Some(FileSystem::NTFS(uuid)));
+            }
+            return Ok(Some(FileSystem::NTFS(Uuid::nil())));
         }
-        // 5. exFAT: Check for "EXFAT" at offset 3.
         if &buffer[3..8] == b"EXFAT" {
-            return Ok(Some(FileSystem::ExFAT));
+            if let Some(uuid) = read_uuid(path.as_ref(), "fat").await {
+                return Ok(Some(FileSystem::ExFAT(uuid)));
+            }
+            return Ok(Some(FileSystem::ExFAT(Uuid::nil())));
         }
-        // 6. FAT: Check the FS type field.
-        // For FAT32, the field at offset 82 (8 bytes) typically starts with "FAT32".
         if buffer[82..90].starts_with(b"FAT32") {
-            return Ok(Some(FileSystem::FAT32));
+            if let Some(uuid) = read_uuid(path.as_ref(), "fat32").await {
+                return Ok(Some(FileSystem::FAT32(uuid)));
+            }
+            return Ok(Some(FileSystem::FAT32(Uuid::nil())));
         }
-        // For FAT12/16, the field at offset 54 (8 bytes) starts with "FAT12" or "FAT16".
         if buffer[54..62].starts_with(b"FAT12") {
-            return Ok(Some(FileSystem::FAT12));
+            if let Some(uuid) = read_uuid(path.as_ref(), "fat").await {
+                return Ok(Some(FileSystem::FAT12(uuid)));
+            }
+            return Ok(Some(FileSystem::FAT12(Uuid::nil())));
         } else if buffer[54..62].starts_with(b"FAT16") {
-            return Ok(Some(FileSystem::FAT16));
+            if let Some(uuid) = read_uuid(path.as_ref(), "fat").await {
+                return Ok(Some(FileSystem::FAT16(uuid)));
+            }
+            return Ok(Some(FileSystem::FAT16(Uuid::nil())));
         }
-        // 7. ext2/3/4: The superblock starts at offset 1024.
-        // The magic (0xEF53) is at offset 1024+56 = 1080.
         if buffer[1080] == 0x53 && buffer[1081] == 0xef {
-            // Feature flags are stored relative to the superblock start:
-            // Compatible features at offset 1024+92 = 1116, and
-            // Incompatible features at offset 1024+96 = 1120.
             let feature_compat = u32::from_le_bytes(buffer[1116..1120].try_into().unwrap());
             let feature_incompat = u32::from_le_bytes(buffer[1120..1124].try_into().unwrap());
             let has_journal = (feature_compat & 0x0004) != 0;
             let has_extents = (feature_incompat & 0x40) != 0;
+            let uuid = read_uuid(path.as_ref(), "ext").await.unwrap_or(Uuid::nil());
             if !has_journal {
-                return Ok(Some(FileSystem::Ext2));
+                return Ok(Some(FileSystem::Ext2(uuid)));
             } else if has_journal && !has_extents {
-                return Ok(Some(FileSystem::Ext3));
+                return Ok(Some(FileSystem::Ext3(uuid)));
             } else if has_journal && has_extents {
-                return Ok(Some(FileSystem::Ext4));
+                return Ok(Some(FileSystem::Ext4(uuid)));
             }
         }
-        // 8. ReiserFS: Magic "ReIsErFs" at offset 256.
         if &buffer[256..264] == b"ReIsErFs" {
-            return Ok(Some(FileSystem::ReiserFS));
+            // ReiserFS UUID at 0x34 (52) offset in superblock
+            let mut f = tokio::fs::File::open(path.as_ref()).await?;
+            f.seek(SeekFrom::Start(0x34)).await?;
+            let mut uuid_buf = [0u8; 16];
+            f.read_exact(&mut uuid_buf).await?;
+            return Ok(Some(FileSystem::ReiserFS(Uuid::from_bytes(uuid_buf))));
         }
-        // 9. Btrfs: The primary superblock is at offset 65536.
         let mut btrfs_buf = [0u8; 8];
         file.seek(SeekFrom::Start(65536)).await?;
         file.read_exact(&mut btrfs_buf).await?;
         if &btrfs_buf[0..5] == b"BTRFS" {
-            return Ok(Some(FileSystem::Btrfs));
+            if let Some(uuid) = read_uuid(path.as_ref(), "btrfs").await {
+                return Ok(Some(FileSystem::Btrfs(uuid)));
+            }
+            return Ok(Some(FileSystem::Btrfs(Uuid::nil())));
         }
-        // 10. ISO9660: The primary volume descriptor is at offset 32768.
         let mut iso_buf = [0u8; 2048];
         file.seek(SeekFrom::Start(32768)).await?;
         file.read_exact(&mut iso_buf).await?;
-        // For ISO9660, the first byte should be 1 and the next five should be "CD001".
         if iso_buf[0] == 1 && &iso_buf[1..6] == b"CD001" {
             return Ok(Some(FileSystem::ISO9660));
         }
+
         Ok(None)
+    }
+}
+
+// Helper to wrap reading a UUID for a given FS type
+async fn read_uuid(dev: &Path, fs: &str) -> Option<Uuid> {
+    use tokio::io::AsyncSeekExt;
+    let mut f = File::open(dev).await.ok()?;
+    let mut buf = [0u8; 512];
+    match fs {
+        "ext" => {
+            let mut sb = [0u8; 1024 + 0x78];
+            f.read_exact(&mut sb).await.ok()?;
+            Some(Uuid::from_bytes(
+                sb[1024 + 0x68..1024 + 0x78].try_into().ok()?,
+            ))
+        }
+        "xfs" => {
+            f.read_exact(&mut buf[..64]).await.ok()?;
+            Some(Uuid::from_bytes(buf[32..48].try_into().ok()?))
+        }
+        "btrfs" => {
+            f.seek(SeekFrom::Start(65536 + 0x20)).await.ok()?;
+            f.read_exact(&mut buf[..16]).await.ok()?;
+            Some(Uuid::from_bytes(buf[..16].try_into().ok()?))
+        }
+        "fat" => {
+            f.read_exact(&mut buf).await.ok()?;
+            let offset = 0x43; // FAT12/16
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&buf[offset..offset + 4]);
+            Some(Uuid::from_bytes(id))
+        }
+        "fat32" => {
+            f.read_exact(&mut buf).await.ok()?;
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&buf[0x67..0x6B]);
+            Some(Uuid::from_bytes(id))
+        }
+        "ntfs" => {
+            f.seek(SeekFrom::Start(0x48)).await.ok()?; // NTFS Volume Serial
+            f.read_exact(&mut buf[..8]).await.ok()?;
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&buf[..8]);
+            Some(Uuid::from_bytes(id))
+        }
+        _ => None,
     }
 }
 
