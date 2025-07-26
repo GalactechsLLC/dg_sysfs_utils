@@ -200,12 +200,14 @@ pub struct SpaceInfo {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum DiskType {
-    Mmc,
+    Emmc,
     Nvme,
     Scsi,
     Test,
     Unknown,
     Virtual,
+    Optical,
+    Ide,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,11 +301,19 @@ impl SysFsNode for Disk {
                 let device = Path::new(DEV_DIR).join(name);
                 let name = name.to_string_lossy().to_string();
                 let disk_type = if name.starts_with("sd") {
-                    DiskType::Scsi
+                    DiskType::Scsi // Standard SCSI/SATA disks
                 } else if name.starts_with("nvme") {
-                    DiskType::Nvme
+                    DiskType::Nvme // NVMe devices
+                } else if name.starts_with("vd") {
+                    DiskType::Virtual // Virtio (KVM/QEMU virtual disks)
+                } else if name.starts_with("hd") {
+                    DiskType::Ide // Legacy IDE disks
+                } else if name.starts_with("mmcblk") {
+                    DiskType::Emmc // eMMC/SD card storage
+                } else if name.starts_with("sr") {
+                    DiskType::Optical // CD/DVD drives
                 } else {
-                    DiskType::Unknown
+                    DiskType::Unknown // Fallback
                 };
                 let partitions = find_partitions(path).await?;
                 let file_system = if partitions.is_empty() {
