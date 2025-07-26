@@ -54,9 +54,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::classes::block::{BlockDevice, BlockEnumerator};
-    use tokio::fs;
 
     #[tokio::test]
     pub async fn test_block_enumerator() {
